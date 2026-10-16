@@ -40,13 +40,14 @@ func (s *stage) expandGlobList(globs ...string) ([]string, error) {
 	return ret, nil
 }
 
-// createPasswd creates the users and groups as described in config.Passwd.
-func (s *stage) createPasswd(config types.Config) error {
-	if err := s.ensureGroups(config); err != nil {
+// applyPasswd reconciles groups and users (in that order) and marks
+// passwd-related paths for relabeling.  Home-directory permissions and
+// SSH keys are finalized separately once file identities are applied.
+func (s *stage) applyPasswd(config types.Config, p *filesPlan) error {
+	if err := s.reconcileGroups(config, p); err != nil {
 		return fmt.Errorf("failed to configure groups: %v", err)
 	}
-
-	if err := s.ensureUsers(config); err != nil {
+	if err := s.reconcileUsers(config, p); err != nil {
 		return fmt.Errorf("failed to configure users: %v", err)
 	}
 
@@ -101,63 +102,6 @@ func (s *stage) createPasswd(config types.Config) error {
 			} else {
 				s.relabel(unprefixed)
 			}
-		}
-	}
-
-	return nil
-}
-
-// ensureUsers ensures that users match the state described
-// in config.Passwd.Users.
-func (s stage) ensureUsers(config types.Config) error {
-	if len(config.Passwd.Users) == 0 {
-		return nil
-	}
-	s.PushPrefix("ensureUsers")
-	defer s.PopPrefix()
-
-	for _, u := range config.Passwd.Users {
-		if err := s.EnsureUser(u); err != nil {
-			return fmt.Errorf("failed to create user %q: %v",
-				u.Name, err)
-		}
-
-		if util.IsFalse(u.ShouldExist) {
-			continue
-		}
-
-		if err := s.ModifyHomeDirPermissions(u); err != nil {
-			return fmt.Errorf("failed to modify home directory permissions for %q: %v",
-				u.Name, err)
-		}
-
-		if err := s.SetPasswordHash(u); err != nil {
-			return fmt.Errorf("failed to set password for %q: %v",
-				u.Name, err)
-		}
-
-		if err := s.AuthorizeSSHKeys(u); err != nil {
-			return fmt.Errorf("failed to add keys to user %q: %v",
-				u.Name, err)
-		}
-	}
-
-	return nil
-}
-
-// ensureGroups ensures that groups match the state described
-// in config.Passwd.Groups.
-func (s stage) ensureGroups(config types.Config) error {
-	if len(config.Passwd.Groups) == 0 {
-		return nil
-	}
-	s.PushPrefix("ensureGroups")
-	defer s.PopPrefix()
-
-	for _, g := range config.Passwd.Groups {
-		if err := s.EnsureGroup(g); err != nil {
-			return fmt.Errorf("failed to create group %q: %v",
-				g.Name, err)
 		}
 	}
 

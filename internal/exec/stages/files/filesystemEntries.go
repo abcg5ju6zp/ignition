@@ -15,12 +15,13 @@
 package files
 
 import (
+	"bytes"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
 	"strings"
 	"time"
 
@@ -28,7 +29,6 @@ import (
 	"github.com/coreos/ignition/v2/config/v3_7_experimental/types"
 	"github.com/coreos/ignition/v2/internal/distro"
 	"github.com/coreos/ignition/v2/internal/exec/util"
-	"github.com/coreos/ignition/v2/internal/log"
 
 	"github.com/vincent-petithory/dataurl"
 )
@@ -46,29 +46,38 @@ func buildCrypttabOptions(hasNetworkDev bool) string {
 	return "," + options
 }
 
-// createCrypttabEntries creates entries inside of /etc/crypttab for LUKS volumes,
-// as well as copying keyfiles to the sysroot.
-func (s *stage) createCrypttabEntries(config types.Config) error {
+// buildLuksPlan plans the /etc/crypttab entry, LUKS keyfiles and CEX
+// secure-key repository files as luks-phase targets.
+func (s *stage) buildLuksPlan(config types.Config, p *filesPlan) error {
+	if err := s.buildCrypttabPlan(config, p); err != nil {
+		return err
+	}
+	return s.buildCexVolumeKeyPlan(config, p)
+}
+
+// buildCrypttabPlan plans entries inside of /etc/crypttab for LUKS
+// volumes, as well as copying keyfiles to the sysroot.
+func (s *stage) buildCrypttabPlan(config types.Config, p *filesPlan) error {
 	if len(config.Storage.Luks) == 0 {
 		return nil
 	}
 
-	s.PushPrefix("createCrypttabEntries")
+	s.PushPrefix("buildCrypttabPlan")
 	defer s.PopPrefix()
 
 	path, err := s.JoinPath("/etc/crypttab")
 	if err != nil {
 		return fmt.Errorf("building crypttab filepath: %v", err)
 	}
-	crypttab := fileEntry{
-		types.Node{
+	crypttab := types.File{
+		Node: types.Node{
 			Path: path,
 		},
-		types.FileEmbedded1{
+		FileEmbedded1: types.FileEmbedded1{
 			Mode: cutil.IntToPtr(0600),
 		},
 	}
-	extrafiles := []filesystemEntry{}
+	var extrafiles []types.File
 	for _, luks := range config.Storage.Luks {
 		out, err := exec.Command(distro.CryptsetupCmd(), "luksUUID", util.DeviceAlias(*luks.Device)).CombinedOutput()
 		if err != nil {
@@ -89,11 +98,11 @@ func (s *stage) createCrypttabEntries(config types.Config) error {
 			if err != nil {
 				return fmt.Errorf("building keyfile path: %v", err)
 			}
-			extrafiles = append(extrafiles, fileEntry{
-				types.Node{
+			extrafiles = append(extrafiles, types.File{
+				Node: types.Node{
 					Path: keyfilePath,
 				},
-				types.FileEmbedded1{
+				FileEmbedded1: types.FileEmbedded1{
 					Contents: types.Resource{
 						Source: &contentsUri,
 					},
@@ -118,64 +127,58 @@ func (s *stage) createCrypttabEntries(config types.Config) error {
 		if _, err := os.Stat(realpath); err != nil {
 			if !os.IsNotExist(err) {
 				return fmt.Errorf("checking if keyfile dir exists: %v", err)
-			} else {
-				extrafiles = append([]filesystemEntry{
-					dirEntry{
-						types.Node{
-							Path: realpath,
-						},
-						types.DirectoryEmbedded1{
-							Mode: cutil.IntToPtr(0700),
-						},
-					},
-				}, extrafiles...)
+			}
+			d := types.Directory{
+				Node: types.Node{
+					Path: realpath,
+				},
+				DirectoryEmbedded1: types.DirectoryEmbedded1{
+					Mode: cutil.IntToPtr(0700),
+				},
+			}
+			if err := s.addDirectoryInPhase(p, phaseLuks, d); err != nil {
+				return err
 			}
 		}
 	}
-	extrafiles = append(extrafiles, crypttab)
-	if err := s.createEntries(extrafiles); err != nil {
-		return fmt.Errorf("adding luks related files: %v", err)
+	for _, f := range extrafiles {
+		if _, err := s.addFileTarget(p, f, phaseLuks, "luks keyfile"); err != nil {
+			return fmt.Errorf("adding luks keyfile: %v", err)
+		}
 	}
-	// delete the persisted keyfiles from state so that the keyfiles are stored on
-	// only the root device which can be encrypted
-	s.State.LuksPersistKeyFiles = nil
+	if _, err := s.addFileTarget(p, crypttab, phaseLuks, "crypttab"); err != nil {
+		return fmt.Errorf("adding crypttab: %v", err)
+	}
 	return nil
 }
 
-// createProviderOutputFiles writes out any files saved in state by
-// provider fetch.
-func (s *stage) createProviderOutputFiles() error {
-	var entries []filesystemEntry
+// buildProviderPlan plans any files saved in state by provider
+// fetch.
+func (s *stage) buildProviderPlan(p *filesPlan) error {
 	for _, file := range s.State.ProviderOutputFiles {
 		path, err := s.JoinPath(file.Path)
 		if err != nil {
 			return fmt.Errorf("calculating path for %q: %w", file.Path, err)
 		}
-		entry := fileEntry(file)
-		entry.Path = path
-		entries = append(entries, entry)
+		file.Path = path
+		if _, err := s.addFileTarget(p, file, phasePublish, "provider output"); err != nil {
+			return err
+		}
 	}
-	return s.createEntries(entries)
+	return nil
 }
 
-// createResultFile creates a report recording some details about the
+// buildResultData renders the report recording details about the
 // Ignition run.
-func (s *stage) createResultFile() error {
-	if distro.ResultFilePath() == "" {
-		return nil
-	}
-
-	s.PushPrefix("createResultFile")
-	defer s.PopPrefix()
-
+func (s *stage) buildResultData() ([]byte, error) {
 	var prevReport interface{}
 	prevPath, err := s.JoinPath(distro.ResultFilePath())
 	if err != nil {
-		return fmt.Errorf("building previous result file path: %w", err)
+		return nil, fmt.Errorf("building previous result file path: %w", err)
 	}
 	prevData, err := os.ReadFile(prevPath)
 	if err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("reading previous report: %w", err)
+		return nil, fmt.Errorf("reading previous report: %w", err)
 	}
 	if err == nil {
 		// To check if it's a live system
@@ -184,16 +187,15 @@ func (s *stage) createResultFile() error {
 				s.Notice("failed to run is-live-image hook: %v", err)
 			}
 			s.Warning("Ignition has already run on this system. Unexpected behavior may occur. Ignition is not designed to run more than once per system.")
-			err = json.Unmarshal(prevData, &prevReport)
-			if err != nil {
-				return fmt.Errorf("couldn't unmarshal previous report output: %v", err)
+			if err := json.Unmarshal(prevData, &prevReport); err != nil {
+				return nil, fmt.Errorf("couldn't unmarshal previous report output: %v", err)
 			}
 		}
 	}
 
 	bootIDBytes, err := os.ReadFile(distro.BootIDPath())
 	if err != nil {
-		return fmt.Errorf("reading boot ID: %w", err)
+		return nil, fmt.Errorf("reading boot ID: %w", err)
 	}
 
 	result := struct {
@@ -215,60 +217,15 @@ func (s *stage) createResultFile() error {
 
 	data, err := json.MarshalIndent(result, "", "  ")
 	if err != nil {
-		return fmt.Errorf("marshaling result file: %w", err)
+		return nil, fmt.Errorf("marshaling result file: %w", err)
 	}
 	data = append(data, '\n')
-
-	path, err := s.JoinPath(distro.ResultFilePath())
-	if err != nil {
-		return fmt.Errorf("building result file path: %w", err)
-	}
-	contentsUri := dataurl.EncodeBytes(data)
-	entries := []filesystemEntry{
-		fileEntry{
-			types.Node{
-				Path: path,
-				// Ignition is not designed to run twice,
-				// but don't introduce a hard failure if it
-				// does
-				Overwrite: cutil.BoolToPtr(true),
-			},
-			types.FileEmbedded1{
-				Contents: types.Resource{
-					Source: &contentsUri,
-				},
-				Mode: cutil.IntToPtr(0600),
-			},
-		},
-	}
-	if err := s.createEntries(entries); err != nil {
-		return fmt.Errorf("adding result file: %v", err)
-	}
-	return nil
+	return data, nil
 }
 
-// createFilesystemsEntries creates the files described in config.Storage.{Files,Directories}.
-func (s *stage) createFilesystemsEntries(config types.Config) error {
-	s.PushPrefix("createFilesystemsFiles")
-	defer s.PopPrefix()
-
-	entries, err := s.getOrderedCreationList(config)
-	if err != nil {
-		return err
-	}
-
-	if err := s.createEntries(entries); err != nil {
-		return fmt.Errorf("failed to create files: %v", err)
-	}
-
-	return nil
-}
-
-// filesystemEntry represent a thing that knows how to create itself.
+// filesystemEntry represent a thing that knows its node.  The concrete
+// entry types are retained for tests and plan construction helpers.
 type filesystemEntry interface {
-	// create creates the entry if specified. It assumes that if overwrite=true then any existing
-	// files at the path will have been deleted.
-	create(l *log.Logger, u util.Util) error
 	node() types.Node
 }
 
@@ -278,209 +235,16 @@ func (tmp fileEntry) node() types.Node {
 	return types.File(tmp).Node
 }
 
-func (tmp fileEntry) create(l *log.Logger, u util.Util) error {
-	f := types.File(tmp)
-
-	empty := "" // golang--
-
-	st, err := os.Lstat(f.Path)
-	regular := (st == nil) || st.Mode().IsRegular()
-	switch {
-	case os.IsNotExist(err) && f.Contents.Source == nil:
-		// set f.Contents so we create an empty file
-		f.Contents.Source = &empty
-	case os.IsNotExist(err):
-		break
-	case err != nil:
-		return err
-	// Cases where there is file there
-	case !regular:
-		return fmt.Errorf("error creating file %q: A non regular file exists there already and overwrite is false", f.Path)
-	case f.Contents.Source != nil:
-		return fmt.Errorf("error creating file %q: A file exists there already and overwrite is false", f.Path)
-	case regular && f.Contents.Source == nil:
-		break
-	default:
-		// nolint:staticcheck
-		return fmt.Errorf("Ignition encountered an internal error processing %q and must die now. Please file a bug", f.Path)
-	}
-
-	fetchOps, err := u.PrepareFetches(l, f)
-	if err != nil {
-		return fmt.Errorf("failed to resolve file %q: %v", f.Path, err)
-	}
-
-	for _, op := range fetchOps {
-		msg := "writing file %q"
-		if op.Append {
-			msg = "appending to file %q"
-		}
-		if err := l.LogOp(
-			func() error {
-				return u.PerformFetch(op)
-			}, msg, f.Path,
-		); err != nil {
-			return fmt.Errorf("failed to create file %q: %v", op.Node.Path, err)
-		}
-	}
-	if err := u.SetPermissions(f.Mode, f.Node); err != nil {
-		return fmt.Errorf("error setting file permissions for %s: %v", f.Path, err)
-	}
-	return nil
-}
-
 type dirEntry types.Directory
 
 func (tmp dirEntry) node() types.Node {
 	return types.Directory(tmp).Node
 }
 
-func (tmp dirEntry) create(l *log.Logger, u util.Util) error {
-	d := types.Directory(tmp)
-	st, err := os.Lstat(d.Path)
-	switch {
-	case os.IsNotExist(err):
-		// use default perms, we'll fix it later
-		if err := os.MkdirAll(d.Path, util.DefaultDirectoryPermissions); err != nil {
-			return fmt.Errorf("failed to create directory %s: %v", d.Path, err)
-		}
-	case err != nil:
-		return fmt.Errorf("stat() failed on %s: %v", d.Path, err)
-	case !st.Mode().IsDir():
-		return fmt.Errorf("error creating directory %s: A non-directory already exists and overwrite is false", d.Path)
-	}
-
-	if err := u.SetPermissions(d.Mode, d.Node); err != nil {
-		return fmt.Errorf("error setting directory permissions for %s: %v", d.Path, err)
-	}
-	return nil
-}
-
 type linkEntry types.Link
 
 func (tmp linkEntry) node() types.Node {
 	return types.Link(tmp).Node
-}
-
-func (tmp linkEntry) create(l *log.Logger, u util.Util) error {
-	s := types.Link(tmp)
-	hard := cutil.IsTrue(s.Hard)
-	st, err := os.Lstat(s.Path)
-	switch {
-	case os.IsNotExist(err):
-		break
-	case err != nil:
-		return fmt.Errorf("stat() failed on %s: %v", s.Path, err)
-	case hard:
-		// check that the file at that path points to the same inode as target
-		targetPath, err := u.JoinPath(*s.Target)
-		if err != nil {
-			return fmt.Errorf("error resolving target path of hard link %s: %v", s.Path, err)
-		}
-		targetst, err := os.Lstat(targetPath)
-		if err != nil {
-			return fmt.Errorf("error creating hard link %s: target does not exist or stat() returned an err: %v", s.Path, err)
-		}
-		if !os.SameFile(st, targetst) {
-			return fmt.Errorf("error creating hard link %s: a file already exists at that path but is not the target and overwrite is false", s.Path)
-		}
-		l.Info("Hardlink %s to %s already exists, doing nothing", s.Path, *s.Target)
-		return nil
-	case !hard:
-		// if the existing file is a symlink, check that its target is correct
-		if st.Mode()&os.ModeSymlink != 0 {
-			if target, err := os.Readlink(s.Path); err != nil {
-				return fmt.Errorf("error reading link at %s: %v", s.Path, err)
-			} else if filepath.Clean(target) != filepath.Clean(*s.Target) {
-				return fmt.Errorf("error creating symlink %s: a symlink exists at that path but points to %s, not %s and overwrite is false", s.Path, target, *s.Target)
-			} else {
-				l.Info("Symlink %s to %s already exists, doing nothing", s.Path, *s.Target)
-				return nil
-			}
-		}
-		return fmt.Errorf("error creating symlink %s: a non-symlink already exists at that path and overwrite is false", s.Path)
-	}
-
-	if err := l.LogOp(
-		func() error {
-			return u.WriteLink(s)
-		}, "writing link %q -> %q", s.Path, *s.Target,
-	); err != nil {
-		return fmt.Errorf("failed to create link %q: %v", s.Path, err)
-	}
-
-	return nil
-}
-
-// getOrderedCreationList resolves all symlinks in the node paths and sets the path to be
-// prepended by the sysroot. It orders the list from shallowest (e.g. /a) to deepeset
-// (e.g. /a/b/c/d/e).
-func (s stage) getOrderedCreationList(config types.Config) ([]filesystemEntry, error) {
-	entries := []filesystemEntry{}
-	// Map from paths in the config to where they resolve for duplicate checking
-	paths := map[string]string{}
-	for _, d := range config.Storage.Directories {
-		path, err := s.JoinPath(d.Path)
-		if err != nil {
-			return nil, err
-		}
-		if existing, ok := paths[path]; ok {
-			return nil, fmt.Errorf("directory at %s resolved to %s after symlink chasing, but another entry with path %s also resolves there",
-				d.Path, path, existing)
-		}
-		paths[path] = d.Path
-		d.Path = path
-		entries = append(entries, dirEntry(d))
-	}
-
-	for _, f := range config.Storage.Files {
-		path, err := s.JoinPath(f.Path)
-		if err != nil {
-			return nil, err
-		}
-		if existing, ok := paths[path]; ok {
-			return nil, fmt.Errorf("file at %s resolved to %s after symlink chasing, but another entry with path %s also resolves there",
-				f.Path, path, existing)
-		}
-		paths[path] = f.Path
-		f.Path = path
-		entries = append(entries, fileEntry(f))
-	}
-
-	hardlinks := []filesystemEntry{}
-	for _, l := range config.Storage.Links {
-		path, err := s.JoinPath(l.Path)
-		if err != nil {
-			return nil, err
-		}
-		if existing, ok := paths[path]; ok {
-			return nil, fmt.Errorf("link at %s resolved to %s after symlink chasing, but another entry with path %s also resolves there",
-				l.Path, path, existing)
-		}
-		paths[path] = l.Path
-		l.Path = path
-		if cutil.IsTrue(l.Hard) {
-			hardlinks = append(hardlinks, linkEntry(l))
-		} else {
-			entries = append(entries, linkEntry(l))
-		}
-
-	}
-	sort.Slice(entries, func(i, j int) bool { return util.Depth(entries[i].node().Path) < util.Depth(entries[j].node().Path) })
-
-	// Append all the hard links to the list after sorting. This allows
-	// Ignition to create hard links to files that are deeper than the hard
-	// link. For reference: https://github.com/coreos/ignition/issues/800
-	entries = append(entries, hardlinks...)
-
-	return entries, nil
-}
-
-func (s *stage) removePathOnOverwrite(e filesystemEntry) error {
-	if cutil.IsTrue(e.node().Overwrite) {
-		return os.RemoveAll(e.node().Path)
-	}
-	return nil
 }
 
 // relabelPath schedules relabeling for the path. The first component which was
@@ -500,36 +264,436 @@ func (s *stage) relabelPath(path string) error {
 	return nil
 }
 
-// createEntries creates any files or directories listed for the filesystem in Storage.{Files,Directories}.
-func (s *stage) createEntries(entries []filesystemEntry) error {
-	s.PushPrefix("createFiles")
-	defer s.PopPrefix()
+// scheduleRelabel records the target's relabel path, replaying the
+// original selection on a resumed run so a created directory subtree is
+// still covered.
+func (s *stage) scheduleRelabel(t *plannedTarget) error {
+	if !s.relabeling() {
+		return nil
+	}
+	if t.Relabel == "" {
+		if err := s.relabelPath(t.Path); err != nil {
+			return err
+		}
+		missingPath, err := util.FindFirstMissingPathComponent(t.Path)
+		if err != nil {
+			return err
+		}
+		t.Relabel = missingPath[len(s.DestDir):]
+	} else {
+		s.relabel(t.Relabel)
+	}
+	return nil
+}
 
-	for _, e := range entries {
-		path := e.node().Path
-		if !strings.HasPrefix(path, s.DestDir) {
-			panic(fmt.Sprintf("Entry path %s isn't under prefix %s", path, s.DestDir))
+// replayTargetRelabels re-adds every planned target's relabel
+// selection, including confirmed ones, so a resumed run still labels
+// everything the previous invocation created.
+func (s *stage) replayTargetRelabels(p *filesPlan) {
+	for _, t := range p.cp.Targets {
+		if err := s.scheduleRelabel(t); err != nil {
+			s.Warning("failed to schedule relabel for %s: %v", t.Path, err)
 		}
+	}
+}
 
-		if err := s.relabelPath(path); err != nil {
-			return fmt.Errorf("error relabeling paths for %s: %v", path, err)
-		}
-		if err := s.removePathOnOverwrite(e); err != nil {
-			return fmt.Errorf("error removing existing file %s: %v", path, err)
-		}
-		if err := e.create(s.Logger, s.Util); err != nil {
-			return fmt.Errorf("error creating %s: %v", path, err)
+// applyTargets applies every unconfirmed target of a phase, in plan
+// order.  Confirmed targets still contribute their relabel selection.
+func (s *stage) applyTargets(p *filesPlan, phase string) error {
+	for _, t := range p.targetsInPhase(phase) {
+		if err := s.applyTarget(p, t); err != nil {
+			return err
 		}
 	}
 	return nil
 }
 
-// save the cex Volume keys
-func (s *stage) createCexVolumeKeys(config types.Config) error {
+// applyTarget guards, materializes and verifies a single target.
+func (s *stage) applyTarget(p *filesPlan, t *plannedTarget) error {
+	if !strings.HasPrefix(t.Path, s.DestDir) {
+		panic(fmt.Sprintf("Target path %s isn't under prefix %s", t.Path, s.DestDir))
+	}
+
+	if err := s.scheduleRelabel(t); err != nil {
+		return fmt.Errorf("error relabeling paths for %s: %v", t.Path, err)
+	}
+
+	if t.Confirmed {
+		return nil
+	}
+
+	if !t.Overwrite && !t.Chained && t.Kind != kindMask {
+		alreadyDesired, err := s.guardTarget(t)
+		if err != nil {
+			return err
+		}
+		if alreadyDesired {
+			t.Confirmed = true
+			return p.save()
+		}
+	} else if t.Overwrite || t.Kind == kindMask {
+		// Explicit overwrite or mask: the plan owns whatever is there.
+		if err := os.RemoveAll(t.Path); err != nil {
+			return fmt.Errorf("error removing existing file %s: %v", t.Path, err)
+		}
+	}
+
+	if err := s.materializeTarget(p, t); err != nil {
+		return err
+	}
+	if err := s.verifyTarget(t); err != nil {
+		return err
+	}
+
+	t.Confirmed = true
+	return p.save()
+}
+
+// guardTarget verifies that a target the plan has not confirmed yet is
+// still either in the state captured by the plan or already matching the
+// desired end state.  Anything else is rejected as an external
+// modification.
+func (s *stage) guardTarget(t *plannedTarget) (bool, error) {
+	cur, err := captureIdentity(t.Path, false)
+	if err != nil {
+		return false, err
+	}
+
+	snapshotMatches := false
+	if t.Original == nil || !t.Original.Exists {
+		snapshotMatches = !cur.Exists
+	} else if sameIdentity(cur, t.Original) {
+		snapshotMatches = true
+	}
+
+	// For files extended with Append resources, the existing bytes are
+	// part of the pinned identity too.
+	if snapshotMatches && t.PrefixObj != "" && cur.Exists {
+		got, err := hashRegularFile(t.Path)
+		if err != nil {
+			return false, err
+		}
+		if !bytesEqual(got, t.Original.ContentSum) {
+			snapshotMatches = false
+		}
+	}
+
+	if !snapshotMatches {
+		desired, err := s.targetMatchesDesired(t, cur)
+		if err != nil {
+			return false, err
+		}
+		if !desired {
+			return false, fmt.Errorf("%w: %q", ErrTargetModifiedExternally, t.Path)
+		}
+		return true, nil
+	}
+	return false, nil
+}
+
+// targetMatchesDesired reports whether the current state already equals
+// the planned end state, allowing the stage to adopt work finished
+// immediately before a process exit.
+func (s *stage) targetMatchesDesired(t *plannedTarget, cur *targetIdentity) (bool, error) {
+	if !cur.Exists {
+		return t.Kind == kindUnmask, nil
+	}
+	switch t.Kind {
+	case targetTypeDir:
+		return cur.Type == targetTypeDir, nil
+	case targetTypeFile:
+		if cur.Type != targetTypeFile || t.FinalSum == nil {
+			return false, nil
+		}
+		return verifyRegularFileContent(t.Path, t.FinalSum)
+	case targetTypeSymlink:
+		return cur.Type == targetTypeSymlink &&
+			filepath.Clean(cur.LinkTarget) == filepath.Clean(t.LinkTarget), nil
+	case kindHardlink:
+		if cur.Type != targetTypeFile {
+			return false, nil
+		}
+		st, err := os.Lstat(t.Path)
+		if err != nil {
+			return false, err
+		}
+		targetst, err := os.Lstat(t.LinkTarget)
+		if err != nil {
+			return false, nil
+		}
+		return os.SameFile(st, targetst), nil
+	case kindMask:
+		return cur.Type == targetTypeSymlink && cur.LinkTarget == "/dev/null", nil
+	case kindUnmask:
+		return !(cur.Type == targetTypeSymlink && cur.LinkTarget == "/dev/null"), nil
+	default:
+		return false, nil
+	}
+}
+
+// materializeTarget creates or replaces the target on disk.
+func (s *stage) materializeTarget(p *filesPlan, t *plannedTarget) error {
+	switch t.Kind {
+	case targetTypeDir:
+		if err := os.MkdirAll(t.Path, util.DefaultDirectoryPermissions); err != nil {
+			return fmt.Errorf("failed to create directory %s: %v", t.Path, err)
+		}
+	case targetTypeFile:
+		if err := s.writePlannedFile(p, t); err != nil {
+			return err
+		}
+	case targetTypeSymlink:
+		if err := util.MkdirForFile(t.Path); err != nil {
+			return fmt.Errorf("could not create leading directories: %v", err)
+		}
+		if err := os.Symlink(t.LinkTarget, t.Path); err != nil {
+			return fmt.Errorf("could not create symlink: %v", err)
+		}
+	case kindHardlink:
+		if err := util.MkdirForFile(t.Path); err != nil {
+			return fmt.Errorf("could not create leading directories: %v", err)
+		}
+		if err := os.Link(t.LinkTarget, t.Path); err != nil {
+			return fmt.Errorf("failed to create hard link %s: %v", t.Path, err)
+		}
+	case kindMask:
+		if err := util.MkdirForFile(t.Path); err != nil {
+			return fmt.Errorf("could not create leading directories: %v", err)
+		}
+		if err := os.RemoveAll(t.Path); err != nil {
+			return err
+		}
+		if err := os.Symlink("/dev/null", t.Path); err != nil {
+			return fmt.Errorf("could not mask unit: %v", err)
+		}
+	case kindUnmask:
+		id, err := captureIdentity(t.Path, false)
+		if err != nil {
+			return err
+		}
+		if id.Exists && id.Type == targetTypeSymlink && id.LinkTarget == "/dev/null" {
+			if err := os.Remove(t.Path); err != nil {
+				return fmt.Errorf("unmasking unit %s: %v", t.Path, err)
+			}
+		}
+	default:
+		return fmt.Errorf("unknown target kind %q for %s", t.Kind, t.Path)
+	}
+	return nil
+}
+
+// writePlannedFile composes the final content from staged objects and
+// atomically replaces the destination.
+func (s *stage) writePlannedFile(p *filesPlan, t *plannedTarget) error {
+	if t.FinalSum == nil {
+		// Existing content must be preserved.
+		return nil
+	}
+	if err := util.MkdirForFile(t.Path); err != nil {
+		return err
+	}
+
+	// Compose into a temporary file in the same directory so the
+	// rename is atomic and on the same filesystem.
+	tmp, err := os.CreateTemp(filepath.Dir(t.Path), "tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	cleanup := func() {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+	}
+
+	// os.CreateTemp defaults to 0600; unit/file contents default to
+	// 0644 until the identity phase sets the configured mode.
+	if err := tmp.Chmod(util.DefaultFilePermissions); err != nil {
+		cleanup()
+		return err
+	}
+	// Append-only entries replace a pre-existing file; preserve its
+	// ownership and mode unless the config overrides them, matching the
+	// former in-place append behavior.
+	if t.PrefixObj != "" && t.Original != nil && t.Original.Exists {
+		if err := tmp.Chown(t.Original.Uid, t.Original.Gid); err != nil {
+			cleanup()
+			return fmt.Errorf("preserving ownership of %q: %v", t.Path, err)
+		}
+		if err := tmp.Chmod(util.ToFileMode(int(t.Original.Mode))); err != nil {
+			cleanup()
+			return fmt.Errorf("preserving mode of %q: %v", t.Path, err)
+		}
+	}
+
+	h := sha256.New()
+	write := func(data []byte) error {
+		if _, err := h.Write(data); err != nil {
+			return err
+		}
+		_, err := tmp.Write(data)
+		return err
+	}
+	if t.PrefixObj != "" {
+		data, err := p.readObject(t.PrefixObj)
+		if err != nil {
+			cleanup()
+			return fmt.Errorf("reading staged prefix for %q: %v", t.Path, err)
+		}
+		if err := write(data); err != nil {
+			cleanup()
+			return err
+		}
+	}
+	for _, f := range t.Fetches {
+		data, err := p.readObject(f.Obj)
+		if err != nil {
+			cleanup()
+			return fmt.Errorf("reading staged content for %q: %v", t.Path, err)
+		}
+		if err := write(data); err != nil {
+			cleanup()
+			return err
+		}
+	}
+	if !bytes.Equal(h.Sum(nil), t.FinalSum) {
+		cleanup()
+		return fmt.Errorf("internal error composing %q: content checksum mismatch", t.Path)
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpName)
+		return err
+	}
+	if err := os.Rename(tmpName, t.Path); err != nil {
+		_ = os.Remove(tmpName)
+		return err
+	}
+	return nil
+}
+
+// verifyTarget confirms the on-disk target matches the plan after
+// materialization.
+func (s *stage) verifyTarget(t *plannedTarget) error {
+	id, err := captureIdentity(t.Path, false)
+	if err != nil {
+		return err
+	}
+	switch t.Kind {
+	case targetTypeDir:
+		if !id.Exists || id.Type != targetTypeDir {
+			return fmt.Errorf("directory %q was not created as expected", t.Path)
+		}
+	case targetTypeFile:
+		if !id.Exists || id.Type != targetTypeFile {
+			return fmt.Errorf("file %q was not created as expected", t.Path)
+		}
+		if t.FinalSum != nil {
+			ok, err := verifyRegularFileContent(t.Path, t.FinalSum)
+			if err != nil {
+				return err
+			}
+			if !ok {
+				return fmt.Errorf("file %q content checksum mismatch after write", t.Path)
+			}
+		}
+	case targetTypeSymlink:
+		if !id.Exists || id.Type != targetTypeSymlink ||
+			filepath.Clean(id.LinkTarget) != filepath.Clean(t.LinkTarget) {
+			return fmt.Errorf("symlink %q does not point to %q after write", t.Path, t.LinkTarget)
+		}
+	case kindHardlink:
+		st, err := os.Lstat(t.Path)
+		if err != nil {
+			return err
+		}
+		targetst, err := os.Lstat(t.LinkTarget)
+		if err != nil {
+			return fmt.Errorf("hard link target %s: %v", t.LinkTarget, err)
+		}
+		if !os.SameFile(st, targetst) {
+			return fmt.Errorf("hard link %q does not reference %q", t.Path, t.LinkTarget)
+		}
+	case kindMask:
+		if !id.Exists || id.Type != targetTypeSymlink || id.LinkTarget != "/dev/null" {
+			return fmt.Errorf("unit %q is not masked as expected", t.Path)
+		}
+	case kindUnmask:
+		if id.Exists && id.Type == targetTypeSymlink && id.LinkTarget == "/dev/null" {
+			return fmt.Errorf("unit %q is still masked after unmask", t.Path)
+		}
+	}
+	return nil
+}
+
+// applyIdentities applies ownership and mode to the targets of the given
+// phases and verifies the result.  It runs after users/groups have been
+// reconciled so name-based ownership can be resolved.
+func (s *stage) applyIdentities(p *filesPlan, phases ...string) error {
+	want := map[string]bool{}
+	for _, phase := range phases {
+		want[phase] = true
+	}
+	for _, t := range p.cp.Targets {
+		if !want[t.Phase] || t.PermDone || t.Node == nil {
+			continue
+		}
+		// Unconfirmed targets should have failed earlier, but be explicit.
+		if !t.Confirmed && t.Kind != targetTypeDir {
+			continue
+		}
+		if t.Kind != targetTypeDir && t.Kind != targetTypeFile &&
+			t.Kind != targetTypeSymlink && t.Kind != kindHardlink {
+			continue
+		}
+		if err := s.SetPermissions(t.Mode, *t.Node); err != nil {
+			return fmt.Errorf("error setting permissions for %s: %v", t.Path, err)
+		}
+		if err := s.verifyIdentity(t); err != nil {
+			return err
+		}
+		t.PermDone = true
+		if err := p.save(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// verifyIdentity verifies configured uid/gid/mode after applying them.
+func (s *stage) verifyIdentity(t *plannedTarget) error {
+	id, err := captureIdentity(t.Path, false)
+	if err != nil {
+		return err
+	}
+	if !id.Exists {
+		return fmt.Errorf("target %q vanished while setting permissions", t.Path)
+	}
+	if t.Mode != nil && id.Mode != uint32(*t.Mode)&07777 {
+		return fmt.Errorf("target %q mode %o does not match expected %o", t.Path, id.Mode, *t.Mode)
+	}
+	defaultUid, defaultGid := id.Uid, id.Gid
+	uid, gid, err := s.ResolveNodeUidAndGid(*t.Node, defaultUid, defaultGid)
+	if err != nil {
+		return fmt.Errorf("failed to determine correct uid and gid for %s: %v", t.Path, err)
+	}
+	if t.Node.User.ID != nil || cutil.NotEmpty(t.Node.User.Name) {
+		if id.Uid != uid {
+			return fmt.Errorf("target %q uid %d does not match expected %d", t.Path, id.Uid, uid)
+		}
+	}
+	if t.Node.Group.ID != nil || cutil.NotEmpty(t.Node.Group.Name) {
+		if id.Gid != gid {
+			return fmt.Errorf("target %q gid %d does not match expected %d", t.Path, id.Gid, gid)
+		}
+	}
+	return nil
+}
+
+// buildCexVolumeKeyPlan plans the CEX secure key repository files.
+func (s *stage) buildCexVolumeKeyPlan(config types.Config, p *filesPlan) error {
 	if len(config.Storage.Luks) == 0 {
 		return nil
 	}
-	s.PushPrefix("createCexVolumeKeys")
+	s.PushPrefix("buildCexVolumeKeyPlan")
 	defer s.PopPrefix()
 	for _, luks := range config.Storage.Luks {
 		if !luks.Cex.IsPresent() {
@@ -537,9 +701,8 @@ func (s *stage) createCexVolumeKeys(config types.Config) error {
 		}
 		// zkey generates, validates and reencipher secure key. The information file
 		// which contains the description about keys for key management.
-		entries := []filesystemEntry{}
 		fileExt := util.ZkeySecureKeyRepoFiles(luks.Name)
-		for _, zfile := range fileExt {
+		for zkeyExt, zfile := range fileExt {
 			zkeyFile := filepath.Join(distro.LuksRealVolumeKeyFilePath(), zfile)
 			// Write zkeyfiles into sysroot
 			contentsUri, ok := s.State.LuksPersistSecureKeyRepoFiles[zfile]
@@ -550,20 +713,20 @@ func (s *stage) createCexVolumeKeys(config types.Config) error {
 			if err != nil {
 				return fmt.Errorf("building zkeyfile path: %v", err)
 			}
-			entries = append(entries, fileEntry{
-				types.Node{
+			f := types.File{
+				Node: types.Node{
 					Path: zkeyFilepath,
 				},
-				types.FileEmbedded1{
+				FileEmbedded1: types.FileEmbedded1{
 					Contents: types.Resource{
 						Source: &contentsUri,
 					},
 					Mode: cutil.IntToPtr(0600),
 				},
-			})
-		}
-		if err := s.createEntries(entries); err != nil {
-			return fmt.Errorf("adding luks volume related files: %v", err)
+			}
+			if _, err := s.addFileTarget(p, f, phaseLuks, "cex key"); err != nil {
+				return fmt.Errorf("adding luks volume related file %q: %v", zkeyExt, err)
+			}
 		}
 	}
 	return nil

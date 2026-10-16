@@ -33,6 +33,10 @@ var (
 	systemRuntimeConfigDir = "/run/ignition"
 	systemLocalConfigDir   = "/etc/ignition"
 	systemConfigDir        = "/usr/lib/ignition"
+	// filesStageDir holds the files stage checkpoint and staged
+	// contents while the stage is in progress, allowing it to resume
+	// after a process exit or relabeling failure.
+	filesStageDir = "/run/ignition/files-stage"
 
 	// Helper programs
 	groupaddCmd  = "groupadd"
@@ -105,6 +109,12 @@ func SystemConfigDirs() []string {
 		SystemLocalConfigDir(),
 		SystemConfigDir(),
 	}
+}
+
+// FilesStageDir returns the directory used by the files stage for its
+// checkpoint file and staged contents.
+func FilesStageDir() string {
+	return fromEnv("FILES_STAGE_DIR", filesStageDir)
 }
 
 func GroupaddCmd() string  { return groupaddCmd }

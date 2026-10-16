@@ -75,6 +75,19 @@ func (s stage) Run(config types.Config) error {
 	return s.runImpl(config, false, false)
 }
 
+// runImpl applies the config in four gates:
+//
+//  1. Plan: pin the config generation, enumerate every target path and
+//     snapshot the original identity of anything already present.
+//  2. Fetch: retrieve and verify all remote contents into a staging
+//     directory; the sysroot is untouched until this succeeds.
+//  3. Apply: create directories, files and links, reconcile groups and
+//     users, apply identities, write units/dropins and LUKS support
+//     files. Each target is verified and individually confirmed in a
+//     checkpoint so the stage can resume after process exit or relabel
+//     failure.
+//  4. Publish: presets, provider output files and the result file are
+//     only published once the whole content set is confirmed.
 func (s stage) runImpl(config types.Config, isApply bool, applyIgnoreUnsupported bool) error {
 	if !isApply {
 		// !isApply: SELinux is handled differently in container flows
@@ -89,48 +102,187 @@ func (s stage) runImpl(config types.Config, isApply bool, applyIgnoreUnsupported
 		if !applyIgnoreUnsupported && (len(config.Passwd.Users) > 0 || len(config.Passwd.Groups) > 0) {
 			return errors.New("cannot apply passwd live")
 		}
-	} else {
-		if err := s.createPasswd(config); err != nil {
+	}
+
+	// Gate 1: plan and pin the generation.
+	p, err := s.initPlan(config, isApply)
+	if err != nil {
+		return fmt.Errorf("failed to initialize files stage plan: %v", err)
+	}
+	if isApply {
+		// Container flow has no resume state on disk.
+		defer p.cleanup()
+	}
+	if p.cp.Completed {
+		// A previous invocation completed but did not get to clean up.
+		p.cleanup()
+		return nil
+	}
+	if err := s.buildPlan(config, p); err != nil {
+		return fmt.Errorf("failed to build files stage plan: %v", err)
+	}
+
+	// Gate 2: fetch and verify everything first.
+	if err := s.fetchAll(p); err != nil {
+		return fmt.Errorf("failed to fetch staged contents: %v", err)
+	}
+
+	// Gate 3a: directories, files, links.
+	if err := s.applyTargets(p, phaseStorage); err != nil {
+		return fmt.Errorf("failed to create files: %v", err)
+	}
+
+	if !isApply {
+		// Gate 3b: groups and users (and passwd relabel marks).
+		if err := s.applyPasswd(config, p); err != nil {
 			return fmt.Errorf("failed to create users/groups: %v", err)
 		}
 	}
 
-	if err := s.createFilesystemsEntries(config); err != nil {
-		return fmt.Errorf("failed to create files: %v", err)
+	// Gate 3c: ownership and mode now that referenced users exist.
+	if err := s.applyIdentities(p, phaseStorage); err != nil {
+		return fmt.Errorf("failed to set file identities: %v", err)
 	}
 
-	if err := s.createUnits(config); err != nil {
+	if !isApply {
+		// Gate 3d: home permissions and authorized keys.
+		if err := s.finalizeUsers(config, p); err != nil {
+			return err
+		}
+	}
+
+	// Gate 3e: units, dropins and mask/unmask.
+	if err := s.applyUnits(p); err != nil {
 		return fmt.Errorf("failed to create units: %v", err)
 	}
 
 	if !isApply {
-		// !isApply: we don't support LUKS, so this isn't necessary
-		if err := s.createCrypttabEntries(config); err != nil {
-			return fmt.Errorf("creating crypttab entries: %v", err)
+		// Gate 3f: crypttab entries and LUKS/CEX key files.
+		if err := s.applyLuks(config, p); err != nil {
+			return err
 		}
 
-		// !isApply: saves LUKS volume key
-		if err := s.createCexVolumeKeys(config); err != nil {
-			return fmt.Errorf("creating cex volume key entries: %v", err)
-		}
-
-		// !isApply: we don't support arbitrary providers
-		if err := s.createProviderOutputFiles(); err != nil {
-			return fmt.Errorf("creating provider state files: %v", err)
-		}
-
-		// !isApply: we support running Ignition multiple times
-		if err := s.createResultFile(); err != nil {
-			return fmt.Errorf("creating result file: %v", err)
-		}
-
-		// !isApply: SELinux is handled differently in container flows
-		if err := s.relabelFiles(); err != nil {
-			return fmt.Errorf("failed to handle relabeling: %v", err)
+		// Relabel the whole content set before publishing anything.
+		if !p.cp.RelabelContentDone {
+			s.replayTargetRelabels(p)
+			if err := s.relabelFiles(); err != nil {
+				return fmt.Errorf("failed to handle relabeling: %v", err)
+			}
+			p.cp.RelabelContentDone = true
+			if err := p.save(); err != nil {
+				return err
+			}
 		}
 	}
 
+	// Gate 4: publication, only after the content set is confirmed.
+	if !p.cp.PresetsDone {
+		if err := s.publishPresets(p); err != nil {
+			return fmt.Errorf("failed to publish systemd presets: %v", err)
+		}
+	}
+
+	if !isApply {
+		if err := s.publishProvider(p); err != nil {
+			return fmt.Errorf("creating provider state files: %v", err)
+		}
+		if err := s.publishResult(p); err != nil {
+			return fmt.Errorf("creating result file: %v", err)
+		}
+
+		if !p.cp.RelabelPublishDone {
+			// Confirmed publication targets and the preset file must be
+			// covered even when publication was skipped on resume.
+			s.replayTargetRelabels(p)
+			if len(p.cp.Presets) > 0 {
+				if presetPath, err := s.JoinPath(util.PresetPath); err != nil {
+					return err
+				} else if err := s.relabelPath(presetPath); err != nil {
+					return err
+				}
+			}
+			if err := s.relabelFiles(); err != nil {
+				return fmt.Errorf("failed to relabel published files: %v", err)
+			}
+			p.cp.RelabelPublishDone = true
+			if err := p.save(); err != nil {
+				return err
+			}
+		}
+	}
+
+	p.cp.Completed = true
+	if err := p.save(); err != nil {
+		return err
+	}
+	p.cleanup()
 	return nil
+}
+
+// applyLuks applies the planned crypttab and keyfile targets and then
+// clears the persisted key material from state.
+func (s *stage) applyLuks(config types.Config, p *filesPlan) error {
+	if err := s.applyTargets(p, phaseLuks); err != nil {
+		return fmt.Errorf("adding luks related files: %v", err)
+	}
+	if err := s.applyIdentities(p, phaseLuks); err != nil {
+		return fmt.Errorf("setting luks file permissions: %v", err)
+	}
+	// delete the persisted keyfiles from state so that the keyfiles are
+	// stored on only the root device which can be encrypted
+	if len(config.Storage.Luks) > 0 {
+		s.State.LuksPersistKeyFiles = nil
+	}
+	return nil
+}
+
+// publishProvider applies provider-generated output files.
+func (s *stage) publishProvider(p *filesPlan) error {
+	if p.cp.ProviderDone {
+		return nil
+	}
+	// The result file is appended to this phase later; applyTargets only
+	// touches targets that currently exist.
+	if err := s.applyTargets(p, phasePublish); err != nil {
+		return err
+	}
+	if err := s.applyIdentities(p, phasePublish); err != nil {
+		return err
+	}
+	p.cp.ProviderDone = true
+	return p.save()
+}
+
+// publishResult renders and installs the run result file.
+func (s *stage) publishResult(p *filesPlan) error {
+	if p.cp.ResultDone {
+		return nil
+	}
+	if distro.ResultFilePath() == "" {
+		p.cp.ResultDone = true
+		return p.save()
+	}
+
+	data, err := s.buildResultData()
+	if err != nil {
+		return err
+	}
+	path, err := s.JoinPath(distro.ResultFilePath())
+	if err != nil {
+		return fmt.Errorf("building result file path: %v", err)
+	}
+	t, err := s.stagePublishFile(p, path, data, 0600)
+	if err != nil {
+		return err
+	}
+	if err := s.applyTarget(p, t); err != nil {
+		return err
+	}
+	if err := s.applyIdentities(p, phasePublish); err != nil {
+		return err
+	}
+	p.cp.ResultDone = true
+	return p.save()
 }
 
 // checkRelabeling determines whether relabeling is supported/requested so that
