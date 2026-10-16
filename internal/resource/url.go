@@ -28,6 +28,7 @@ import (
 	"net/netip"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -148,9 +149,12 @@ type FetchOptions struct {
 	RetryCodes []int
 }
 
-// FetchToBuffer will fetch the given url into a temporary file, and then read
-// in the contents of the file and delete it. It will return the downloaded
-// contents, or an error if one was encountered.
+// FetchToBuffer will fetch the given url into memory. It will return the
+// downloaded contents, or an error if one was encountered. When the fetch
+// involves authenticated and unauthenticated attempts (Azure Blob or S3),
+// every attempt writes into a private candidate buffer; only the contents of
+// an attempt which was fully read, decompressed and digest-verified are
+// returned, and no partial contents are ever returned on error.
 func (f *Fetcher) FetchToBuffer(u url.URL, opts FetchOptions) ([]byte, error) {
 	if f.Offline && util.UrlNeedsNet(u) {
 		return nil, ErrNeedNet
@@ -160,27 +164,13 @@ func (f *Fetcher) FetchToBuffer(u url.URL, opts FetchOptions) ([]byte, error) {
 	dest := new(bytes.Buffer)
 	switch u.Scheme {
 	case "http", "https":
-		isAzureBlob := strings.HasSuffix(u.Host, ".blob.core.windows.net")
-		if f.AzSession != nil && isAzureBlob {
-			err = f.fetchFromAzureBlob(u, dest, opts)
-			if err != nil {
-				f.Logger.Info("could not fetch %s via Azure credentials: %v", u.String(), err)
-				f.Logger.Info("falling back to HTTP fetch")
-			}
-		}
-		if !isAzureBlob || f.AzSession == nil || err != nil {
-			err = f.fetchFromHTTP(u, dest, opts)
-		}
+		return f.fetchHTTPWithAzureFallbackToBuffer(u, opts)
 	case "tftp":
 		err = f.fetchFromTFTP(u, dest, opts)
 	case "data":
 		err = f.fetchFromDataURL(u, dest, opts)
 	case "s3", "arn":
-		buf := &s3buf{
-			WriteAtBuffer: manager.NewWriteAtBuffer([]byte{}),
-		}
-		err = f.fetchFromS3(u, buf, opts)
-		return buf.Bytes(), err
+		return f.fetchFromS3ToBuffer(u, opts)
 	case "gs":
 		err = f.fetchFromGCS(u, dest, opts)
 	case "":
@@ -188,7 +178,10 @@ func (f *Fetcher) FetchToBuffer(u url.URL, opts FetchOptions) ([]byte, error) {
 	default:
 		return nil, ErrSchemeUnsupported
 	}
-	return dest.Bytes(), err
+	if err != nil {
+		return nil, err
+	}
+	return dest.Bytes(), nil
 }
 
 // s3buf is a wrapper around the aws.WriteAtBuffer that also allows reading and seeking.
@@ -224,31 +217,29 @@ func (s *s3buf) Seek(offset int64, whence int) (int64, error) {
 // at the beginning. Since some url schemes (ex: s3) use chunked downloads and
 // fetch chunks out of order, Fetch's behavior when dest is not an empty file is
 // undefined.
+//
+// Schemes which try more than one authentication or protocol (Azure Blob
+// with an HTTP(S) fallback, and S3 with an anonymous fallback) never write a
+// failed attempt's bytes, file offset, or hash state into dest. Each attempt
+// streams into its own private temporary candidate, and only the candidate
+// which is fully read, decompressed and digest-verified is copied into dest;
+// every other candidate is discarded. On such an error dest is left empty,
+// and callers which fetch into their own temporary file (see exec/util) only
+// rename it into place after success, so partial contents can neither be
+// observed nor published.
 func (f *Fetcher) Fetch(u url.URL, dest *os.File, opts FetchOptions) error {
 	if f.Offline && util.UrlNeedsNet(u) {
 		return ErrNeedNet
 	}
-	var err error
 	switch u.Scheme {
 	case "http", "https":
-		isAzureBlob := strings.HasSuffix(u.Host, ".blob.core.windows.net")
-		if f.AzSession != nil && isAzureBlob {
-			err = f.fetchFromAzureBlob(u, dest, opts)
-			if err != nil {
-				f.Logger.Info("could not fetch %s via Azure credentials: %v", u.String(), err)
-				f.Logger.Info("falling back to HTTP fetch")
-			}
-		}
-		if !isAzureBlob || f.AzSession == nil || err != nil {
-			err = f.fetchFromHTTP(u, dest, opts)
-		}
-		return err
+		return f.fetchHTTPWithAzureFallbackToFile(u, dest, opts)
 	case "tftp":
 		return f.fetchFromTFTP(u, dest, opts)
 	case "data":
 		return f.fetchFromDataURL(u, dest, opts)
 	case "s3", "arn":
-		return f.fetchFromS3(u, dest, opts)
+		return f.fetchFromS3ToFile(u, dest, opts)
 	case "gs":
 		return f.fetchFromGCS(u, dest, opts)
 	case "":
@@ -256,6 +247,135 @@ func (f *Fetcher) Fetch(u url.URL, dest *os.File, opts FetchOptions) error {
 	default:
 		return ErrSchemeUnsupported
 	}
+}
+
+// fetchCandidateFunc performs one authentication or protocol attempt,
+// writing the attempt's stream into cand. It must return nil only after the
+// whole stream has been read, decompressed and digest-verified; any bytes
+// written after a returned error belong exclusively to this attempt and must
+// never reach another attempt or the caller.
+type fetchCandidateFunc func(cand io.Writer) error
+
+// fetchToBufferWithFallback runs the given attempts in order, each against a
+// fresh in-memory candidate. The first attempt which completes successfully
+// wins and its exact contents are returned; failed candidates are dropped so
+// their bytes and hash state cannot be continued by a later attempt. If every
+// attempt fails, the last error is returned along with no contents.
+func (f *Fetcher) fetchToBufferWithFallback(attempts []fetchCandidateFunc) ([]byte, error) {
+	var err error
+	for _, attempt := range attempts {
+		cand := new(bytes.Buffer)
+		if err = attempt(cand); err == nil {
+			return cand.Bytes(), nil
+		}
+	}
+	return nil, err
+}
+
+// fetchToFileWithFallback runs the given attempts in order, each against a
+// fresh private temporary file candidate. The first attempt which completes
+// successfully wins and only its verified contents are copied into dest; all
+// candidate files are removed. If every attempt fails, the last error is
+// returned and dest is left untouched (and empty). A publication error is
+// final: the winner was already fully verified, so no other protocol is tried.
+func (f *Fetcher) fetchToFileWithFallback(dest *os.File, attempts []fetchCandidateFunc) error {
+	var err error
+	dir := filepath.Dir(dest.Name())
+	for _, attempt := range attempts {
+		cand, candErr := newFetchCandidate(dir)
+		if candErr != nil {
+			return candErr
+		}
+		if err = attempt(cand); err == nil {
+			err = publishFileCandidate(dest, cand)
+			releaseFetchCandidate(cand)
+			return err
+		}
+		releaseFetchCandidate(cand)
+	}
+	return err
+}
+
+// fetchHTTPWithAzureFallbackToBuffer performs, in order, the authenticated
+// Azure Blob attempt (when AzSession is configured and the URL points at a
+// blob endpoint) and the plain HTTP(S) attempt, each in an isolated
+// candidate buffer. See fetchToBufferWithFallback.
+func (f *Fetcher) fetchHTTPWithAzureFallbackToBuffer(u url.URL, opts FetchOptions) ([]byte, error) {
+	var attempts []fetchCandidateFunc
+	if f.AzSession != nil && strings.HasSuffix(u.Host, ".blob.core.windows.net") {
+		attempts = append(attempts, func(cand io.Writer) error {
+			err := f.fetchFromAzureBlob(u, cand, opts)
+			if err != nil {
+				f.Logger.Info("could not fetch %s via Azure credentials: %v", u.String(), err)
+				f.Logger.Info("falling back to HTTP fetch")
+			}
+			return err
+		})
+	}
+	attempts = append(attempts, func(cand io.Writer) error {
+		return f.fetchFromHTTP(u, cand, opts)
+	})
+	return f.fetchToBufferWithFallback(attempts)
+}
+
+// fetchHTTPWithAzureFallbackToFile is the file-backed counterpart of
+// fetchHTTPWithAzureFallbackToBuffer. The verified winning candidate is
+// published into dest, never the partially written candidate of a failed
+// attempt.
+func (f *Fetcher) fetchHTTPWithAzureFallbackToFile(u url.URL, dest *os.File, opts FetchOptions) error {
+	var attempts []fetchCandidateFunc
+	if f.AzSession != nil && strings.HasSuffix(u.Host, ".blob.core.windows.net") {
+		attempts = append(attempts, func(cand io.Writer) error {
+			err := f.fetchFromAzureBlob(u, cand, opts)
+			if err != nil {
+				f.Logger.Info("could not fetch %s via Azure credentials: %v", u.String(), err)
+				f.Logger.Info("falling back to HTTP fetch")
+			}
+			return err
+		})
+	}
+	attempts = append(attempts, func(cand io.Writer) error {
+		return f.fetchFromHTTP(u, cand, opts)
+	})
+	return f.fetchToFileWithFallback(dest, attempts)
+}
+
+// fetchCandidatePrefix is the prefix of the private temporary files backing
+// individual fetch attempts.
+const fetchCandidatePrefix = "ignition-fetch-"
+
+// newFetchCandidate creates a private temporary file in dir (which should be
+// the directory of the caller's destination file, so they share a filesystem)
+// which backs a single authentication or protocol attempt. It is never
+// shared with another attempt, so a failed attempt's bytes, cursor and (for
+// s3) out-of-order chunks cannot leak into a fallback.
+func newFetchCandidate(dir string) (*os.File, error) {
+	return os.CreateTemp(dir, fetchCandidatePrefix+"*")
+}
+
+// releaseFetchCandidate closes and removes a candidate temporary file.
+func releaseFetchCandidate(cand *os.File) {
+	name := cand.Name()
+	_ = cand.Close()
+	_ = os.Remove(name)
+}
+
+// publishFileCandidate copies the fully read, decompressed and
+// digest-verified contents of cand into dest, which is expected to be the
+// empty file handed to Fetch. cand's read offset is rewound first; dest is
+// truncated to defend against any pre-existing bytes.
+func publishFileCandidate(dest, cand *os.File) error {
+	if _, err := cand.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	if err := dest.Truncate(0); err != nil {
+		return err
+	}
+	if _, err := dest.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	_, err := io.Copy(dest, cand)
+	return err
 }
 
 // FetchFromTFTP fetches a resource from u via TFTP into dest, returning an
@@ -464,53 +584,65 @@ type s3target interface {
 	io.ReadSeeker
 }
 
-// FetchFromS3 gets data from an S3 bucket as described by u and writes it into
-// dest, returning an error if one is encountered. It will attempt to acquire
-// IAM credentials from the EC2 metadata service, and if this fails will attempt
-// to fetch the object with anonymous credentials.
-func (f *Fetcher) fetchFromS3(u url.URL, dest s3target, opts FetchOptions) error {
-	if opts.Compression != "" {
-		return ErrCompressionUnsupported
+// s3Request holds the resolved request parameters and context shared by the
+// authenticated and anonymous download attempts for one S3 object.
+type s3Request struct {
+	ctx    context.Context
+	cancel context.CancelFunc
+	input  *s3.GetObjectInput
+	cfg    aws.Config
+	region string
+	bucket string
+	key    string
+}
+
+// prepareS3Request resolves the bucket, key, region and request context for
+// the given s3:// or arn: URL. It performs no download and is shared by both
+// download attempts.
+func (f *Fetcher) prepareS3Request(u url.URL) (s3Request, error) {
+	req := s3Request{
+		ctx:    context.Background(),
+		cancel: func() {},
 	}
-	ctx := context.Background()
 	if f.client != nil && f.client.timeout != 0 {
-		var cancelFn context.CancelFunc
-		ctx, cancelFn = context.WithTimeout(ctx, f.client.timeout)
-		defer cancelFn()
+		req.ctx, req.cancel = context.WithTimeout(req.ctx, f.client.timeout)
 	}
 
 	// Determine the bucket and key based on the URL scheme
-	var bucket, key, region, regionHint string
+	var region, regionHint string
 	var err error
 	switch u.Scheme {
 	case "s3":
-		bucket = u.Host
+		req.bucket = u.Host
 		// s3 object keys should not start with a leading slash
 		// e.g., s3://bucket/path/to/object => Key: "path/to/object"
-		key = strings.TrimLeft(u.Path, "/")
+		req.key = strings.TrimLeft(u.Path, "/")
 	case "arn":
 		fullURL := u.Scheme + ":" + u.Opaque
 		// Parse the bucket and key from the ARN Resource.
 		// Also set the region for accesspoints.
 		// S3 bucket ARNs don't include the region field.
-		bucket, key, region, regionHint, err = f.parseARN(fullURL)
+		req.bucket, req.key, region, regionHint, err = f.parseARN(fullURL)
 		if err != nil {
-			return err
+			req.cancel()
+			return req, err
 		}
 	default:
-		return ErrSchemeUnsupported
+		req.cancel()
+		return req, ErrSchemeUnsupported
 	}
 
 	if f.client == nil {
 		if err := f.newHttpClient(); err != nil {
-			return err
+			req.cancel()
+			return req, err
 		}
 	}
 
 	if f.AWSConfig == nil {
 		f.AWSConfig = &aws.Config{Credentials: aws.AnonymousCredentials{}}
 	}
-	cfg := *f.AWSConfig
+	req.cfg = *f.AWSConfig
 
 	// Determine the partition and region this bucket is in
 	if region == "" {
@@ -527,75 +659,169 @@ func (f *Fetcher) fetchFromS3(u url.URL, dest s3target, opts FetchOptions) error
 			regionHint = "us-east-1"
 		}
 		// Use the region hint to ask the correct partition for the bucket's region.
-		tmpClient := s3.NewFromConfig(cfg, func(o *s3.Options) {
+		tmpClient := s3.NewFromConfig(req.cfg, func(o *s3.Options) {
 			o.Region = regionHint
 			o.HTTPClient = f.client.client
 		})
-		r, err := manager.GetBucketRegion(ctx, tmpClient, bucket)
+		r, err := manager.GetBucketRegion(req.ctx, tmpClient, req.bucket)
 		if err != nil {
+			req.cancel()
 			var bnf manager.BucketNotFound
 			if errors.As(err, &bnf) {
-				return fmt.Errorf("could not find bucket %q: %w", bucket, err)
+				return req, fmt.Errorf("could not find bucket %q: %w", req.bucket, err)
 			}
-			return fmt.Errorf("couldn't determine the region for bucket %q: %w", bucket, err)
+			return req, fmt.Errorf("couldn't determine the region for bucket %q: %w", req.bucket, err)
 		}
 		region = r
 	}
+	req.region = region
 
 	var versionId *string
 	if v, ok := u.Query()["versionId"]; ok && len(v) > 0 {
 		versionId = aws.String(v[0])
 	}
 
-	input := &s3.GetObjectInput{
-		Bucket:    &bucket,
-		Key:       &key,
+	req.input = &s3.GetObjectInput{
+		Bucket:    &req.bucket,
+		Key:       &req.key,
 		VersionId: versionId,
 	}
+	return req, nil
+}
 
-	client := s3.NewFromConfig(cfg, func(o *s3.Options) {
+// newS3Client builds an S3 client for the resolved region. When anonymous is
+// true, the EC2 IMDS credential chain is bypassed.
+func (f *Fetcher) newS3Client(cfg aws.Config, region string, anonymous bool) *s3.Client {
+	return s3.NewFromConfig(cfg, func(o *s3.Options) {
 		o.Region = region
 		o.HTTPClient = f.client.client
 		o.EndpointOptions.UseDualStackEndpoint = aws.DualStackEndpointStateEnabled
+		if anonymous {
+			o.Credentials = aws.AnonymousCredentials{}
+		}
 	})
+}
 
-	if err := f.fetchFromS3WithClient(ctx, dest, input, client); err != nil {
+// newS3CandidateBuffer creates a private in-memory target for one S3 download
+// attempt. A fresh one must be used for every attempt so chunks that a
+// partially completed multipart download wrote out of order cannot be spliced
+// into a later attempt.
+func newS3CandidateBuffer() *s3buf {
+	return &s3buf{
+		WriteAtBuffer: manager.NewWriteAtBuffer([]byte{}),
+	}
+}
+
+// verifyS3Candidate hashes the complete downloaded candidate after its
+// download finished, returning a digest mismatch error without exposing any
+// of the candidate's bytes. The hash is reset first, so state left by any
+// other attempt never participates.
+func (f *Fetcher) verifyS3Candidate(cand s3target, opts FetchOptions) error {
+	if opts.Hash == nil {
+		return nil
+	}
+	opts.Hash.Reset()
+	if _, err := cand.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	if _, err := io.Copy(opts.Hash, cand); err != nil {
+		return err
+	}
+	calculatedSum := opts.Hash.Sum(nil)
+	if !bytes.Equal(calculatedSum, opts.ExpectedSum) {
+		return util.ErrHashMismatch{
+			Calculated: hex.EncodeToString(calculatedSum),
+			Expected:   hex.EncodeToString(opts.ExpectedSum),
+		}
+	}
+	f.Logger.Debug("file matches expected sum of: %s", hex.EncodeToString(opts.ExpectedSum))
+	return nil
+}
+
+// fetchFromS3ToBuffer downloads the object described by u into memory. It
+// attempts to acquire IAM credentials from the EC2 metadata service, and if
+// that fails attempts the object with anonymous credentials. Each attempt
+// downloads into a private candidate buffer and a failed attempt's chunks are
+// discarded. Only the winning attempt's fully downloaded and digest-verified
+// bytes are returned.
+func (f *Fetcher) fetchFromS3ToBuffer(u url.URL, opts FetchOptions) ([]byte, error) {
+	if opts.Compression != "" {
+		return nil, ErrCompressionUnsupported
+	}
+	req, err := f.prepareS3Request(u)
+	if err != nil {
+		return nil, err
+	}
+	defer req.cancel()
+
+	cand := newS3CandidateBuffer()
+	err = f.fetchFromS3WithClient(req.ctx, cand, req.input, f.newS3Client(req.cfg, req.region, false))
+	if err != nil {
 		// Fallback to anonymous credentials if we failed to retrieve an EC2 IMDS role.
 		// The SDK does not provide a typed error for this case.
-		if strings.Contains(err.Error(), "EC2 IMDS role") {
-			anonClient := s3.NewFromConfig(cfg, func(o *s3.Options) {
-				o.Region = region
-				o.HTTPClient = f.client.client
-				o.EndpointOptions.UseDualStackEndpoint = aws.DualStackEndpointStateEnabled
-				o.Credentials = aws.AnonymousCredentials{}
-			})
-			if err2 := f.fetchFromS3WithClient(ctx, dest, input, anonClient); err2 != nil {
-				return fmt.Errorf("error fetching object %q from bucket %q anonymously: %w (authenticated fetch also failed: %w)", key, bucket, err2, err)
-			}
-		} else {
-			return fmt.Errorf("error fetching object %q from bucket %q: %s", key, bucket, err.Error())
+		if !strings.Contains(err.Error(), "EC2 IMDS role") {
+			return nil, fmt.Errorf("error fetching object %q from bucket %q: %s", req.key, req.bucket, err.Error())
+		}
+		// Drop the partial authenticated candidate, including every chunk the
+		// chunked download may have written out of order, before retrying.
+		cand = newS3CandidateBuffer()
+		anonClient := f.newS3Client(req.cfg, req.region, true)
+		if err2 := f.fetchFromS3WithClient(req.ctx, cand, req.input, anonClient); err2 != nil {
+			return nil, fmt.Errorf("error fetching object %q from bucket %q anonymously: %w (authenticated fetch also failed: %w)", req.key, req.bucket, err2, err)
 		}
 	}
-	if opts.Hash != nil {
-		opts.Hash.Reset()
-		_, err = dest.Seek(0, io.SeekStart)
+	if err := f.verifyS3Candidate(cand, opts); err != nil {
+		return nil, err
+	}
+	return cand.Bytes(), nil
+}
+
+// fetchFromS3ToFile is the file-backed counterpart of fetchFromS3ToBuffer.
+// Each attempt downloads into a private temporary file candidate; only the
+// winning candidate, once fully downloaded and digest-verified, is published
+// into dest. All candidate temporary files are removed.
+func (f *Fetcher) fetchFromS3ToFile(u url.URL, dest *os.File, opts FetchOptions) error {
+	if opts.Compression != "" {
+		return ErrCompressionUnsupported
+	}
+	req, err := f.prepareS3Request(u)
+	if err != nil {
+		return err
+	}
+	defer req.cancel()
+
+	cand, err := newFetchCandidate(filepath.Dir(dest.Name()))
+	if err != nil {
+		return err
+	}
+	err = f.fetchFromS3WithClient(req.ctx, cand, req.input, f.newS3Client(req.cfg, req.region, false))
+	if err != nil {
+		// Fallback to anonymous credentials if we failed to retrieve an EC2 IMDS role.
+		// The SDK does not provide a typed error for this case.
+		if !strings.Contains(err.Error(), "EC2 IMDS role") {
+			releaseFetchCandidate(cand)
+			return fmt.Errorf("error fetching object %q from bucket %q: %s", req.key, req.bucket, err.Error())
+		}
+		// Discard the partial authenticated candidate before retrying so no
+		// chunk can be continued by the anonymous attempt.
+		releaseFetchCandidate(cand)
+		cand, err = newFetchCandidate(filepath.Dir(dest.Name()))
 		if err != nil {
 			return err
 		}
-		_, err = io.Copy(opts.Hash, dest)
-		if err != nil {
-			return err
+		anonClient := f.newS3Client(req.cfg, req.region, true)
+		if err2 := f.fetchFromS3WithClient(req.ctx, cand, req.input, anonClient); err2 != nil {
+			releaseFetchCandidate(cand)
+			return fmt.Errorf("error fetching object %q from bucket %q anonymously: %w (authenticated fetch also failed: %w)", req.key, req.bucket, err2, err)
 		}
-		calculatedSum := opts.Hash.Sum(nil)
-		if !bytes.Equal(calculatedSum, opts.ExpectedSum) {
-			return util.ErrHashMismatch{
-				Calculated: hex.EncodeToString(calculatedSum),
-				Expected:   hex.EncodeToString(opts.ExpectedSum),
-			}
-		}
-		f.Logger.Debug("file matches expected sum of: %s", hex.EncodeToString(opts.ExpectedSum))
 	}
-	return nil
+	if err := f.verifyS3Candidate(cand, opts); err != nil {
+		releaseFetchCandidate(cand)
+		return err
+	}
+	err = publishFileCandidate(dest, cand)
+	releaseFetchCandidate(cand)
+	return err
 }
 
 func (f *Fetcher) fetchFromS3WithClient(ctx context.Context, dest s3target, input *s3.GetObjectInput, client *s3.Client) error {

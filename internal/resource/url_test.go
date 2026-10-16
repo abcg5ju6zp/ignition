@@ -17,16 +17,25 @@ package resource
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
 	"crypto/sha512"
+	stderrors "errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
 	"reflect"
+	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"golang.org/x/oauth2"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
 
 	"github.com/coreos/ignition/v2/config/shared/errors"
 	"github.com/coreos/ignition/v2/internal/log"
@@ -686,4 +695,608 @@ func TestFetchConfigDualStack(t *testing.T) {
 			_ = rpt
 		})
 	}
+}
+
+// Minimal fail-fast assertion helpers; testify/require is not vendored.
+
+func reqNoError(t testing.TB, err error, msg ...any) {
+	t.Helper()
+	if err != nil {
+		t.Fatalf("unexpected error: %v %s", err, fmt.Sprint(msg...))
+	}
+}
+
+func reqError(t testing.TB, err error, msg ...any) {
+	t.Helper()
+	if err == nil {
+		t.Fatalf("expected an error %s", fmt.Sprint(msg...))
+	}
+}
+
+func reqErrorIs(t testing.TB, err, target error) {
+	t.Helper()
+	if !stderrors.Is(err, target) {
+		t.Fatalf("expected error %v, got %v", target, err)
+	}
+}
+
+func reqErrorAs(t testing.TB, err error, target any) {
+	t.Helper()
+	if !stderrors.As(err, target) {
+		t.Fatalf("expected error of type %T, got %v", target, err)
+	}
+}
+
+func reqEqual[T any](t testing.TB, want, got T, msg ...any) {
+	t.Helper()
+	if !reflect.DeepEqual(want, got) {
+		t.Fatalf("not equal: want %#v, got %#v %s", want, got, fmt.Sprint(msg...))
+	}
+}
+
+func reqNil(t testing.TB, v any, msg ...any) {
+	t.Helper()
+	if v == nil {
+		return
+	}
+	rv := reflect.ValueOf(v)
+	switch rv.Kind() {
+	case reflect.Ptr, reflect.Interface, reflect.Slice, reflect.Map, reflect.Chan, reflect.Func:
+		if rv.IsNil() {
+			return
+		}
+	}
+	t.Fatalf("expected nil, got %#v %s", v, fmt.Sprint(msg...))
+}
+
+func reqEmpty(t testing.TB, v []byte, msg ...any) {
+	t.Helper()
+	if len(v) != 0 {
+		t.Fatalf("expected empty, got %#v %s", v, fmt.Sprint(msg...))
+	}
+}
+
+func reqElementsMatch[T any](t testing.TB, want, got []T, msg ...any) {
+	t.Helper()
+	if !assert.ElementsMatch(t, want, got, msg...) {
+		t.FailNow()
+	}
+}
+
+var (
+	errPrimaryInterrupt  = stderrors.New("primary attempt interrupted mid-stream")
+	errSecondaryFails    = stderrors.New("fallback attempt failed too")
+	errSimulatedIMDSRole = stderrors.New("failed to retrieve EC2 IMDS role credentials: simulated")
+)
+
+// failingReader returns data bytes followed by err, simulating a download
+// which writes part of its object before the connection breaks.
+type failingReader struct {
+	data []byte
+	err  error
+}
+
+func (r *failingReader) Read(p []byte) (int, error) {
+	if len(r.data) == 0 {
+		return 0, r.err
+	}
+	n := copy(p, r.data)
+	r.data = r.data[n:]
+	return n, nil
+}
+
+// failingBody is an http.Response.Body which yields a prefix of the object
+// and then an error, modelling a credentialed download dying mid-object.
+type failingBody struct {
+	data []byte
+	err  error
+}
+
+func (b *failingBody) Read(p []byte) (int, error) {
+	if len(b.data) == 0 {
+		return 0, b.err
+	}
+	n := copy(p, b.data)
+	b.data = b.data[n:]
+	return n, nil
+}
+
+func (b *failingBody) Close() error { return nil }
+
+func gzipEncode(t *testing.T, data []byte) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	zw := gzip.NewWriter(&buf)
+	_, err := zw.Write(data)
+	reqNoError(t, err)
+	reqNoError(t, zw.Close())
+	return buf.Bytes()
+}
+
+func newCandidateFetcher(t *testing.T) Fetcher {
+	t.Helper()
+	logger := log.New(true)
+	return Fetcher{Logger: &logger}
+}
+
+func candidateTempFiles(t *testing.T) []string {
+	t.Helper()
+	matches, err := filepath.Glob(filepath.Join(os.TempDir(), fetchCandidatePrefix+"*"))
+	reqNoError(t, err)
+	return matches
+}
+
+// TestFetchToBufferWithFallbackCandidates verifies that, in memory, each
+// authentication/protocol attempt owns an independent candidate: bytes and
+// hash state from an interrupted primary attempt can never be continued by
+// the fallback, only the fully read/decompressed/verified winner is handed
+// back, and failures return no partial contents.
+func TestFetchToBufferWithFallbackCandidates(t *testing.T) {
+	winner := []byte("winner contents\n")
+	winnerSum := sha512.Sum512(winner)
+	validGzip := gzipEncode(t, winner)
+	truncatedGzip := truncatedGzipOf(validGzip)
+
+	tests := []struct {
+		name     string
+		opts     func() FetchOptions
+		attempts []func(f *Fetcher, opts FetchOptions) fetchCandidateFunc
+		expect   []byte
+		// expectErrIs matches sentinel or wrapped errors.
+		expectErrIs []error
+		// expectHashMismatch asserts a digest verification failure.
+		expectHashMismatch bool
+	}{
+		{
+			name: "credentialed stream interrupted, anonymous fallback wins",
+			opts: func() FetchOptions {
+				return FetchOptions{Hash: sha512.New(), ExpectedSum: winnerSum[:]}
+			},
+			attempts: []func(f *Fetcher, opts FetchOptions) fetchCandidateFunc{
+				func(f *Fetcher, opts FetchOptions) fetchCandidateFunc {
+					return func(w io.Writer) error {
+						return f.decompressCopyHashAndVerify(w,
+							&failingReader{data: []byte("GARBAGE-PRIMARY-PREFIX"), err: errPrimaryInterrupt}, opts)
+					}
+				},
+				func(f *Fetcher, opts FetchOptions) fetchCandidateFunc {
+					return func(w io.Writer) error {
+						return f.decompressCopyHashAndVerify(w, bytes.NewReader(winner), opts)
+					}
+				},
+			},
+			expect: winner,
+		},
+		{
+			name: "both attempts fail returns the last error and no bytes",
+			opts: func() FetchOptions { return FetchOptions{} },
+			attempts: []func(f *Fetcher, opts FetchOptions) fetchCandidateFunc{
+				func(f *Fetcher, opts FetchOptions) fetchCandidateFunc {
+					return func(w io.Writer) error {
+						_, _ = w.Write([]byte("primary partial"))
+						return errPrimaryInterrupt
+					}
+				},
+				func(f *Fetcher, opts FetchOptions) fetchCandidateFunc {
+					return func(w io.Writer) error {
+						_, _ = w.Write([]byte("fallback partial"))
+						return errSecondaryFails
+					}
+				},
+			},
+			expectErrIs: []error{errSecondaryFails},
+		},
+		{
+			name: "complete download but digest mismatch rejects candidate",
+			opts: func() FetchOptions {
+				badSum := make([]byte, sha512.Size)
+				badSum[0] = 0xff
+				return FetchOptions{Hash: sha512.New(), ExpectedSum: badSum}
+			},
+			attempts: []func(f *Fetcher, opts FetchOptions) fetchCandidateFunc{
+				func(f *Fetcher, opts FetchOptions) fetchCandidateFunc {
+					return func(w io.Writer) error {
+						return f.decompressCopyHashAndVerify(w, bytes.NewReader(winner), opts)
+					}
+				},
+			},
+			expectHashMismatch: true,
+		},
+		{
+			name: "truncated gzip primary discarded, valid gzip fallback wins",
+			opts: func() FetchOptions {
+				return FetchOptions{
+					Compression: "gzip",
+					Hash:        sha512.New(),
+					ExpectedSum: winnerSum[:],
+				}
+			},
+			attempts: []func(f *Fetcher, opts FetchOptions) fetchCandidateFunc{
+				func(f *Fetcher, opts FetchOptions) fetchCandidateFunc {
+					return func(w io.Writer) error {
+						return f.decompressCopyHashAndVerify(w,
+							bytes.NewReader(truncatedGzip), opts)
+					}
+				},
+				func(f *Fetcher, opts FetchOptions) fetchCandidateFunc {
+					return func(w io.Writer) error {
+						return f.decompressCopyHashAndVerify(w,
+							bytes.NewReader(validGzip), opts)
+					}
+				},
+			},
+			expect: winner,
+		},
+		{
+			name: "invalid gzip stream is rejected with its own error",
+			opts: func() FetchOptions {
+				return FetchOptions{Compression: "gzip"}
+			},
+			attempts: []func(f *Fetcher, opts FetchOptions) fetchCandidateFunc{
+				func(f *Fetcher, opts FetchOptions) fetchCandidateFunc {
+					return func(w io.Writer) error {
+						return f.decompressCopyHashAndVerify(w,
+							bytes.NewReader([]byte("plain text, not gzip")), opts)
+					}
+				},
+			},
+			expectErrIs: []error{gzip.ErrHeader},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			f := newCandidateFetcher(t)
+			opts := test.opts()
+			attempts := make([]fetchCandidateFunc, 0, len(test.attempts))
+			for _, build := range test.attempts {
+				attempts = append(attempts, build(&f, opts))
+			}
+			data, err := f.fetchToBufferWithFallback(attempts)
+			if test.expectHashMismatch {
+				var mismatch util.ErrHashMismatch
+				reqErrorAs(t, err, &mismatch)
+			} else if len(test.expectErrIs) > 0 {
+				reqError(t, err)
+				for _, target := range test.expectErrIs {
+					reqErrorIs(t, err, target)
+				}
+			} else {
+				reqNoError(t, err)
+			}
+			if test.expectHashMismatch || len(test.expectErrIs) > 0 {
+				reqNil(t, data, "no partial contents may be observed on error")
+				return
+			}
+			reqEqual(t, test.expect, data)
+		})
+	}
+}
+
+// truncatedGzipOf returns a truncated copy of a valid gzip stream
+// which begins to inflate and then fails in the middle of the stream, so some
+// decompressed bytes reach the candidate before the error.
+func truncatedGzipOf(gz []byte) []byte {
+	return gz[:len(gz)-8]
+}
+
+// TestFetchToFileWithFallbackCandidates is the file-backed counterpart: each
+// attempt streams into a private temporary candidate, and only the verified
+// winner is published into the caller's destination. Failed candidates and
+// their file offsets never reach either a later attempt or the destination,
+// candidates are removed, and an error leaves the destination empty.
+func TestFetchToFileWithFallbackCandidates(t *testing.T) {
+	winner := []byte("winner contents written to a file\n")
+	winnerSum := sha512.Sum512(winner)
+	validGzip := gzipEncode(t, winner)
+	truncatedGzip := truncatedGzipOf(validGzip)
+
+	before := candidateTempFiles(t)
+
+	t.Run("credentialed stream interrupted, fallback published atomically", func(t *testing.T) {
+		f := newCandidateFetcher(t)
+		dest, err := os.CreateTemp("", "ignition-test-dest-*")
+		reqNoError(t, err)
+		defer func() { _ = os.Remove(dest.Name()) }()
+		defer func() { _ = dest.Close() }()
+
+		opts := FetchOptions{Hash: sha512.New(), ExpectedSum: winnerSum[:]}
+		err = f.fetchToFileWithFallback(dest, []fetchCandidateFunc{
+			func(w io.Writer) error {
+				return f.decompressCopyHashAndVerify(w,
+					&failingReader{data: []byte("GARBAGE-PRIMARY-PREFIX"), err: errPrimaryInterrupt}, opts)
+			},
+			func(w io.Writer) error {
+				return f.decompressCopyHashAndVerify(w, bytes.NewReader(winner), opts)
+			},
+		})
+		reqNoError(t, err)
+
+		got, err := os.ReadFile(dest.Name())
+		reqNoError(t, err)
+		reqEqual(t, winner, got, "destination must contain exactly the winning attempt")
+	})
+
+	t.Run("both attempts fail leaves destination empty and removes candidates", func(t *testing.T) {
+		f := newCandidateFetcher(t)
+		dest, err := os.CreateTemp("", "ignition-test-dest-*")
+		reqNoError(t, err)
+		defer func() { _ = os.Remove(dest.Name()) }()
+		defer func() { _ = dest.Close() }()
+
+		err = f.fetchToFileWithFallback(dest, []fetchCandidateFunc{
+			func(w io.Writer) error {
+				_, _ = w.Write([]byte("primary partial"))
+				return errPrimaryInterrupt
+			},
+			func(w io.Writer) error {
+				_, _ = w.Write([]byte("fallback partial"))
+				return errSecondaryFails
+			},
+		})
+		reqErrorIs(t, err, errSecondaryFails)
+
+		got, err := os.ReadFile(dest.Name())
+		reqNoError(t, err)
+		reqEmpty(t, got, "failed candidates must never reach the destination file")
+	})
+
+	t.Run("complete download with bad digest is never published", func(t *testing.T) {
+		f := newCandidateFetcher(t)
+		dest, err := os.CreateTemp("", "ignition-test-dest-*")
+		reqNoError(t, err)
+		defer func() { _ = os.Remove(dest.Name()) }()
+		defer func() { _ = dest.Close() }()
+
+		badSum := make([]byte, sha512.Size)
+		badSum[0] = 0xff
+		opts := FetchOptions{Hash: sha512.New(), ExpectedSum: badSum}
+		err = f.fetchToFileWithFallback(dest, []fetchCandidateFunc{
+			func(w io.Writer) error {
+				return f.decompressCopyHashAndVerify(w, bytes.NewReader(winner), opts)
+			},
+		})
+		var mismatch util.ErrHashMismatch
+		reqErrorAs(t, err, &mismatch)
+
+		got, err := os.ReadFile(dest.Name())
+		reqNoError(t, err)
+		reqEmpty(t, got)
+	})
+
+	t.Run("publication failure is final and skips later attempts", func(t *testing.T) {
+		f := newCandidateFetcher(t)
+		dest, err := os.CreateTemp("", "ignition-test-dest-*")
+		reqNoError(t, err)
+		defer func() { _ = os.Remove(dest.Name()) }()
+
+		secondRan := false
+		// Close the destination so publication of the verified winner fails.
+		reqNoError(t, dest.Close())
+		err = f.fetchToFileWithFallback(dest, []fetchCandidateFunc{
+			func(w io.Writer) error {
+				_, _ = w.Write(winner)
+				return nil
+			},
+			func(w io.Writer) error {
+				secondRan = true
+				return nil
+			},
+		})
+		reqError(t, err)
+		assert.False(t, secondRan, "no further attempt must run after a verified winner")
+	})
+
+	t.Run("truncated gzip primary discarded, valid gzip fallback wins", func(t *testing.T) {
+		f := newCandidateFetcher(t)
+		dest, err := os.CreateTemp("", "ignition-test-dest-*")
+		reqNoError(t, err)
+		defer func() { _ = os.Remove(dest.Name()) }()
+		defer func() { _ = dest.Close() }()
+
+		opts := FetchOptions{
+			Compression: "gzip",
+			Hash:        sha512.New(),
+			ExpectedSum: winnerSum[:],
+		}
+		err = f.fetchToFileWithFallback(dest, []fetchCandidateFunc{
+			func(w io.Writer) error {
+				return f.decompressCopyHashAndVerify(w, bytes.NewReader(truncatedGzip), opts)
+			},
+			func(w io.Writer) error {
+				return f.decompressCopyHashAndVerify(w, bytes.NewReader(validGzip), opts)
+			},
+		})
+		reqNoError(t, err)
+
+		got, err := os.ReadFile(dest.Name())
+		reqNoError(t, err)
+		reqEqual(t, winner, got)
+	})
+
+	after := candidateTempFiles(t)
+	reqElementsMatch(t, before, after, "temporary candidate files leaked")
+}
+
+// TestPlainHTTPSingleAttemptKeepsSemantics makes sure a non-Azure HTTP(S) URL
+// still performs a single direct fetch (custom headers, digest, file and
+// buffer destinations) through the new attempt wiring.
+func TestPlainHTTPSingleAttemptKeepsSemantics(t *testing.T) {
+	payload := []byte("plain http object\n")
+	sum := sha512.Sum512(payload)
+
+	var gotHeader string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotHeader = r.Header.Get("X-Ignition-Test")
+		w.Header().Set("Content-Length", strconv.Itoa(len(payload)))
+		_, _ = w.Write(payload)
+	}))
+	defer server.Close()
+
+	u, err := url.Parse(server.URL + "/object")
+	reqNoError(t, err)
+
+	opts := FetchOptions{
+		Hash:        sha512.New(),
+		ExpectedSum: sum[:],
+		Headers:     http.Header{"X-Ignition-Test": []string{"candidate"}},
+	}
+
+	f := newCandidateFetcher(t)
+
+	data, err := f.FetchToBuffer(*u, opts)
+	reqNoError(t, err)
+	reqEqual(t, payload, data)
+	reqEqual(t, "candidate", gotHeader)
+
+	dest, err := os.CreateTemp("", "ignition-test-dest-*")
+	reqNoError(t, err)
+	defer func() { _ = os.Remove(dest.Name()) }()
+	defer func() { _ = dest.Close() }()
+
+	reqNoError(t, f.Fetch(*u, dest, opts))
+	got, err := os.ReadFile(dest.Name())
+	reqNoError(t, err)
+	reqEqual(t, payload, got)
+}
+
+// testCredentialsProvider is a static aws.CredentialsProvider used to make
+// the authenticated S3 client produce signed requests.
+type testCredentialsProvider struct{}
+
+func (testCredentialsProvider) Retrieve(context.Context) (aws.Credentials, error) {
+	return aws.Credentials{
+		AccessKeyID:     "AKIDEXAMPLE",
+		SecretAccessKey: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+		Source:          "test",
+	}, nil
+}
+
+const s3TestObject = "the complete object contents fetched exactly once\n"
+
+// fakeS3Transport answers S3 GetObject calls without DNS: signed
+// (credentialed) requests can be told apart from anonymous ones.
+type fakeS3Transport struct {
+	t    *testing.T
+	mode int
+}
+
+const (
+	s3FallbackWins = iota
+	s3AllAttemptsFail
+	s3AllAttemptsSucceed
+)
+
+func (rt *fakeS3Transport) RoundTrip(req *http.Request) (*http.Response, error) {
+	signed := req.Header.Get("Authorization") != "" ||
+		req.URL.Query().Get("X-Amz-Signature") != ""
+
+	serveFull := rt.mode == s3AllAttemptsSucceed ||
+		(rt.mode == s3FallbackWins && !signed)
+
+	hdr := http.Header{}
+	hdr.Set("ETag", `"etag"`)
+	hdr.Set("Content-Length", strconv.Itoa(len(s3TestObject)))
+	resp := &http.Response{
+		StatusCode:    http.StatusOK,
+		Proto:         "HTTP/1.1",
+		ProtoMajor:    1,
+		ProtoMinor:    1,
+		Header:        hdr,
+		ContentLength: int64(len(s3TestObject)),
+		Request:       req,
+	}
+	if serveFull {
+		resp.Body = io.NopCloser(strings.NewReader(s3TestObject))
+	} else {
+		// Die after seven bytes with an error whose text triggers the
+		// anonymous fallback, just like a missing EC2 IMDS role would.
+		resp.Body = &failingBody{
+			data: []byte(s3TestObject[:7]),
+			err:  errSimulatedIMDSRole,
+		}
+	}
+	return resp, nil
+}
+
+func newS3TestFetcher(t *testing.T, mode int) Fetcher {
+	t.Helper()
+	f := newCandidateFetcher(t)
+	reqNoError(t, f.newHttpClient())
+	f.client.client = &http.Client{Transport: &fakeS3Transport{t: t, mode: mode}}
+	f.AWSConfig = &aws.Config{
+		Region:      "us-east-1",
+		Credentials: testCredentialsProvider{},
+	}
+	return f
+}
+
+func s3AccessPointURL(t *testing.T) url.URL {
+	t.Helper()
+	u, err := url.Parse("arn:aws:s3:us-east-1:123456789012:accesspoint/test/object/key")
+	reqNoError(t, err)
+	return *u
+}
+
+// TestFetchFromS3Candidates covers the S3 authenticated -> anonymous fallback
+// with isolated per-attempt candidates, both in memory and on disk, including
+// the distinct outcomes for a successful fallback, total failure, and a
+// complete-but-undigest-verified object.
+func TestFetchFromS3Candidates(t *testing.T) {
+	objectSum := sha512.Sum512([]byte(s3TestObject))
+	u := s3AccessPointURL(t)
+
+	t.Run("partial credentialed download then anonymous success to buffer", func(t *testing.T) {
+		f := newS3TestFetcher(t, s3FallbackWins)
+		data, err := f.FetchToBuffer(u, FetchOptions{
+			Hash:        sha512.New(),
+			ExpectedSum: objectSum[:],
+		})
+		reqNoError(t, err)
+		reqEqual(t, s3TestObject, string(data),
+			"the authenticated prefix must not be spliced onto the anonymous object")
+	})
+
+	t.Run("partial credentialed download then anonymous success to file", func(t *testing.T) {
+		before := candidateTempFiles(t)
+		f := newS3TestFetcher(t, s3FallbackWins)
+		dest, err := os.CreateTemp("", "ignition-test-dest-*")
+		reqNoError(t, err)
+		defer func() { _ = os.Remove(dest.Name()) }()
+		defer func() { _ = dest.Close() }()
+
+		reqNoError(t, f.Fetch(u, dest, FetchOptions{
+			Hash:        sha512.New(),
+			ExpectedSum: objectSum[:],
+		}))
+		got, err := os.ReadFile(dest.Name())
+		reqNoError(t, err)
+		reqEqual(t, s3TestObject, string(got))
+
+		reqElementsMatch(t, before, candidateTempFiles(t),
+			"temporary candidate files leaked")
+	})
+
+	t.Run("both attempts fail keeps the distinct combined error", func(t *testing.T) {
+		f := newS3TestFetcher(t, s3AllAttemptsFail)
+		data, err := f.FetchToBuffer(u, FetchOptions{})
+		reqError(t, err)
+		reqNil(t, data)
+		assert.Contains(t, err.Error(), "anonymously")
+		assert.Contains(t, err.Error(), "authenticated fetch also failed")
+	})
+
+	t.Run("complete object failing digest returns mismatch and no bytes", func(t *testing.T) {
+		f := newS3TestFetcher(t, s3AllAttemptsSucceed)
+		badSum := make([]byte, sha512.Size)
+		badSum[0] = 0xff
+		data, err := f.FetchToBuffer(u, FetchOptions{
+			Hash:        sha512.New(),
+			ExpectedSum: badSum,
+		})
+		reqError(t, err)
+		reqNil(t, data)
+		var mismatch util.ErrHashMismatch
+		reqErrorAs(t, err, &mismatch)
+	})
 }
